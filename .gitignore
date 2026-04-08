@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE / editor
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+
+# Lock files (regenerated per-platform)
+uv.lock
+
+# Training output
+docker_hardening/output/
+wandb/
+runs/
+checkpoints/
+output/
+
+docs/hackathon_docs/
+docs
