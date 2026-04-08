@@ -395,7 +395,7 @@ Both modes use the same scoring logic. Train mode only changes what the agent *s
 1. **Bootstrap.** Reads `HF_TOKEN` (mandatory), `API_BASE_URL` (default: HuggingFace router), `MODEL_NAME` (default: `Qwen/Qwen2.5-72B-Instruct`). Instantiates an `openai.OpenAI` client pointed at the API base URL.
 2. **Per-task loop.** For each of `patch_easy`, `patch_medium`, `patch_hard`:
    - Sets `SCA_GYM_TASK` and `SCA_GYM_MODE=eval`.
-   - Connects to the environment: if `IMAGE_NAME` is set, uses `from_docker_image()`; if `ENV_BASE_URL` is set, uses the HTTP client; otherwise falls back to `_InlineEnv`, which imports the environment class directly and runs it in-process.
+   - Connects to the environment: if `LOCAL_IMAGE_NAME` is set, uses `from_docker_image()`; if `ENV_BASE_URL` is set, uses the HTTP client; otherwise falls back to `_InlineEnv`, which imports the environment class directly and runs it in-process.
    - Calls `reset()`, prints a `[START]` line, then loops up to `MAX_STEPS` times.
 3. **Prompt construction.** `_build_user_prompt()` assembles:
    - The current Dockerfile in a fenced block
@@ -506,7 +506,7 @@ The container has no Docker daemon dependency and runs inside the free Space tie
 | `SCA_GYM_TASK`  | `patch_easy`                            | No       | Active task (overwritten by `inference.py` each loop)      |
 | `SCA_GYM_MODE`  | `eval`                                  | No       | `eval` or `train`                                          |
 | `ENV_BASE_URL`  | —                                       | No       | If set, `inference.py` talks HTTP to this URL              |
-| `IMAGE_NAME`    | —                                       | No       | If set, `inference.py` spawns the env from a Docker image  |
+| `LOCAL_IMAGE_NAME`    | —                                       | No       | If set, `inference.py` spawns the env from a Docker image  |
 
 ---
 

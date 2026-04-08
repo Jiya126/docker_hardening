@@ -25,7 +25,7 @@ from models import DockerHardeningAction, DockerHardeningObservation
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-IMAGE_NAME   = os.getenv("IMAGE_NAME")
+LOCAL_IMAGE_NAME   = os.getenv("LOCAL_IMAGE_NAME")
 
 ENV_NAME    = "docker_hardening"
 TASKS       = ["patch_easy", "patch_medium", "patch_hard"]
@@ -202,8 +202,8 @@ async def run_task(task_name: str, client: OpenAI) -> float:
     os.environ["SCA_GYM_TASK"] = task_name
     os.environ.setdefault("SCA_GYM_MODE", "eval")
 
-    if IMAGE_NAME:
-        env = await DockerHardeningEnv.from_docker_image(IMAGE_NAME)
+    if LOCAL_IMAGE_NAME:
+        env = await DockerHardeningEnv.from_docker_image(LOCAL_IMAGE_NAME)
     elif os.getenv("ENV_BASE_URL"):
         env = DockerHardeningEnv(base_url=os.environ["ENV_BASE_URL"])
     else:
