@@ -1,0 +1,69 @@
+spec_version: 1
+name: docker_hardening
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: >
+  Docker image security hardening environment. The agent reads a Dockerfile
+  and its vulnerability scan report, then submits patched Dockerfiles that
+  fix CVEs and eliminate security anti-patterns. The environment evaluates
+  patches via mock build, mock vulnerability scanning, best-practice checks,
+  and anti-pattern detection, returning a multi-dimensional reward in [0.0, 1.0].
+tasks:
+  - name: patch_easy
+    description: >
+      Fix 2 LOW/MEDIUM system package vulnerabilities in a python:3.11-slim
+      Dockerfile. Agent should upgrade the base image or run apt-get upgrade.
+      Tests basic vulnerability remediation skills.
+    difficulty: easy
+    max_steps: 5
+  - name: patch_medium
+    description: >
+      Fix 5 vulnerabilities (system + pip packages) in a python:3.9-slim
+      Dockerfile that also has security misconfigurations: ADD instead of COPY,
+      missing USER, missing HEALTHCHECK, no cache cleanup. Tests multi-concern
+      security hardening across vulnerability remediation and best practices.
+    difficulty: medium
+    max_steps: 5
+  - name: patch_hard
+    description: >
+      Fix 8 vulnerabilities in a python:3.6-slim Dockerfile with adversarial
+      complexity: secrets in ENV, ADD from URL, log4j false positive (not
+      applicable to Python), pip package CVEs, and exposed database port.
+      Requires reasoning about which vulnerabilities are real, prioritizing
+      fixes, and removing supply-chain risks.
+    difficulty: hard
+    max_steps: 5
+  - name: patch_multistage
+    description: >
+      Multi-stage Dockerfile where build deps (gcc, python3-dev) belong in
+      the builder stage only. Agent must preserve AS builder / final stage
+      structure. Removing gcc from builder breaks C-extension pip installs.
+      Tests understanding of build vs runtime separation.
+    difficulty: hard
+    max_steps: 5
+  - name: patch_conflict
+    description: >
+      Conflicting requirements: upgrading cryptography>=42 requires openssl>=3.0
+      but the Dockerfile pins libssl1.1 for a legacy binary. numpy C-extensions
+      require glibc (switching to alpine breaks them). Some CVEs have no fix.
+      Tests trade-off reasoning under constraints.
+    difficulty: hard
+    max_steps: 5
+  - name: patch_subtle
+    description: >
+      Subtle anti-patterns: secrets hidden as base64-encoded ENV values,
+      credentials in URLs, COPY . . before COPY requirements.txt (cache
+      invalidation), HEALTHCHECK depending on curl that was removed. Tests
+      nuanced security reasoning and attention to detail.
+    difficulty: hard
+    max_steps: 5
+  - name: patch_adversarial
+    description: >
+      Adversarial traps: decoy vuln in myapp-crypto (not cryptography),
+      port 8080 IS the application port, USER root needed for mid-build
+      pip install, chmod 777 on tmp dir. Tests whether the agent avoids
+      over-patching and breaking the application.
+    difficulty: hard
+    max_steps: 5

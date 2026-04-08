@@ -1,0 +1,56 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-docker_hardening"
+version = "0.1.0"
+description = "Docker Hardening RL environment for OpenEnv"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core[core]>=0.2.2",
+    "anthropic>=0.25.0",
+    "openai>=1.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0.0",
+    "httpx>=0.25.0",
+]
+train = [
+    "trl>=0.14.0",
+    "transformers>=4.45.0",
+    "datasets>=3.0.0",
+    "accelerate>=1.0.0",
+    "peft>=0.13.0",
+    "torch>=2.0.0",
+]
+
+[project.scripts]
+server = "docker_hardening.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = [
+    "docker_hardening",
+    "docker_hardening.server",
+    "docker_hardening.tools",
+]
+
+[tool.setuptools.package-dir]
+"docker_hardening"        = "."
+"docker_hardening.server" = "server"
+"docker_hardening.tools"  = "tools"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
