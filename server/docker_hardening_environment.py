@@ -390,10 +390,8 @@ def _compute_improvement_score(
         max(0.0, (initial_ap_count - current_ap_count) / max(initial_ap_count, 1))
         if initial_ap_count > 0 else 0.0
     )
-
-    return min(1.0, max(0.0,
-        w_vuln * vuln_improvement + w_bp * bp_improvement + w_ap * ap_improvement
-    ))
+    raw = w_vuln * vuln_improvement + w_bp * bp_improvement + w_ap * ap_improvement
+    return max(0.01, min(0.99, raw))
 
 
 def _validate_dockerfile(content: str) -> Optional[str]:
@@ -501,7 +499,7 @@ class DockerHardeningEnvironment(Environment):
             initial_vuln_count=initial_report.total_count,
             current_vuln_count=initial_report.total_count,
             step_number=0, max_steps=self._max_steps,
-            score=0.0, done=False, reward=0.0,
+            score=0.01, done=False, reward=0.0,
             step_summary=(
                 f"Task '{task_name}' started. "
                 f"Fix {initial_report.total_count} vulnerabilities in {self._image_tag}."
@@ -669,7 +667,7 @@ class DockerHardeningEnvironment(Environment):
             current_vuln_count=current_count,
             step_number=self._state.step_count,
             max_steps=self._max_steps,
-            score=min(score, 1.0),
+            score=max(0.01, min(0.99, score)),
             step_summary=step_summary,
             last_action_error=error,
             termination_reason=reason,
