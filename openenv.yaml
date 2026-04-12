@@ -3,67 +3,97 @@ name: docker_hardening
 type: space
 runtime: fastapi
 app: server.app:app
-port: 8000
+app_port: 7860
+
 description: >
   Docker image security hardening environment. The agent reads a Dockerfile
-  and its vulnerability scan report, then submits patched Dockerfiles that
-  fix CVEs and eliminate security anti-patterns. The environment evaluates
-  patches via mock build, mock vulnerability scanning, best-practice checks,
-  and anti-pattern detection, returning a multi-dimensional reward in [0.0, 1.0].
+  and its vulnerability scan report, then (1) analyzes security issues and
+  (2) submits a patched Dockerfile. Each episode generates a UNIQUE broken
+  Dockerfile from a randomized pool of security issues, preventing memorization.
+
+observation_type: text
+action_type: json
+reward_range: [0.01, 0.99]
+episode_steps: 2
+
+step_descriptions:
+  1: >
+    Analyze — identify security issues in the Dockerfile. Submit a JSON object
+    with 'identified_issues' (list of free-text issue descriptions) and
+    'identified_categories' (list from: supply_chain, best_practice,
+    network_security, secret_exposure, vulnerability, permissions).
+    Receives actionable feedback on which claims were correct/missed.
+  2: >
+    Patch — submit a fixed Dockerfile. Submit a JSON object with
+    'patched_dockerfile' containing the full text of the patched Dockerfile.
+    Scored on vulnerability reduction, best practices, and anti-pattern removal.
+
+action_schema:
+  analyze:
+    type: object
+    properties:
+      identified_issues:
+        type: array
+        items:
+          type: string
+        description: Free-text descriptions of security issues found
+      identified_categories:
+        type: array
+        items:
+          type: string
+        enum:
+          - supply_chain
+          - best_practice
+          - network_security
+          - secret_exposure
+          - vulnerability
+          - permissions
+        description: Categories of issues found
+  patch:
+    type: object
+    properties:
+      patched_dockerfile:
+        type: string
+        description: The full text of the patched Dockerfile
+    required:
+      - patched_dockerfile
+
+randomization: >
+  Each reset() randomly selects a subset of security issues from a pool
+  of 9-22 possible issues (depending on difficulty), then composes a
+  unique broken Dockerfile containing those issues. CVE pools are also
+  randomly sampled. Different seeds produce different Dockerfiles with
+  different combinations of vulnerabilities, anti-patterns, and
+  best-practice violations.
+
 tasks:
   - name: patch_easy
     description: >
-      Fix 2 LOW/MEDIUM system package vulnerabilities in a python:3.11-slim
-      Dockerfile. Agent should upgrade the base image or run apt-get upgrade.
-      Tests basic vulnerability remediation skills.
+      Fix a python:3.11-slim Dockerfile with 4-6 randomly selected security
+      issues including pipe-to-shell, missing USER/HEALTHCHECK, exposed ports,
+      and missing cache cleanup. Tests basic vulnerability remediation.
     difficulty: easy
-    max_steps: 5
+    max_steps: 2
   - name: patch_medium
     description: >
-      Fix 5 vulnerabilities (system + pip packages) in a python:3.9-slim
-      Dockerfile that also has security misconfigurations: ADD instead of COPY,
-      missing USER, missing HEALTHCHECK, no cache cleanup. Tests multi-concern
-      security hardening across vulnerability remediation and best practices.
+      Fix a python:3.9-slim Dockerfile with 7-10 randomly selected issues
+      including secrets in ENV/ARG, ADD instead of COPY, pip vulnerabilities,
+      and exposed database ports. Tests multi-concern security hardening.
     difficulty: medium
-    max_steps: 5
+    max_steps: 2
   - name: patch_hard
     description: >
-      Fix 8 vulnerabilities in a python:3.6-slim Dockerfile with adversarial
-      complexity: secrets in ENV, ADD from URL, log4j false positive (not
-      applicable to Python), pip package CVEs, and exposed database port.
-      Requires reasoning about which vulnerabilities are real, prioritizing
-      fixes, and removing supply-chain risks.
+      Fix a python:3.6-slim Dockerfile with 10-14 randomly selected issues
+      including ADD from URL, Docker-in-Docker installation, credentials in
+      URLs, base64-encoded secrets, chmod 777, and copy order problems.
+      Tests advanced security reasoning under adversarial complexity.
     difficulty: hard
-    max_steps: 5
-  - name: patch_multistage
-    description: >
-      Multi-stage Dockerfile where build deps (gcc, python3-dev) belong in
-      the builder stage only. Agent must preserve AS builder / final stage
-      structure. Removing gcc from builder breaks C-extension pip installs.
-      Tests understanding of build vs runtime separation.
-    difficulty: hard
-    max_steps: 5
-  - name: patch_conflict
-    description: >
-      Conflicting requirements: upgrading cryptography>=42 requires openssl>=3.0
-      but the Dockerfile pins libssl1.1 for a legacy binary. numpy C-extensions
-      require glibc (switching to alpine breaks them). Some CVEs have no fix.
-      Tests trade-off reasoning under constraints.
-    difficulty: hard
-    max_steps: 5
-  - name: patch_subtle
-    description: >
-      Subtle anti-patterns: secrets hidden as base64-encoded ENV values,
-      credentials in URLs, COPY . . before COPY requirements.txt (cache
-      invalidation), HEALTHCHECK depending on curl that was removed. Tests
-      nuanced security reasoning and attention to detail.
-    difficulty: hard
-    max_steps: 5
-  - name: patch_adversarial
-    description: >
-      Adversarial traps: decoy vuln in myapp-crypto (not cryptography),
-      port 8080 IS the application port, USER root needed for mid-build
-      pip install, chmod 777 on tmp dir. Tests whether the agent avoids
-      over-patching and breaking the application.
-    difficulty: hard
-    max_steps: 5
+    max_steps: 2
+
+endpoints:
+  health: GET /health
+  spec: GET /spec
+  reset: POST /reset {"task_name": "patch_easy"}
+  step: POST /step {"action": {"patched_dockerfile": "..."}}
+  state: GET /state
+  leaderboard: GET /leaderboard

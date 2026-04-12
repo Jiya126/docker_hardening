@@ -626,12 +626,27 @@ _SEVERITY_SCORE = {
 }
 
 
+def select_vuln_subset(
+    difficulty: int, rng: "random.Random",
+) -> list:
+    """Randomly select a subset of CVEs from the template pool for this episode."""
+    full_pool = list(_MOCK_TEMPLATES.get(difficulty, _MOCK_TEMPLATES[1]))
+    ranges = {1: (3, 4), 2: (5, 8), 3: (8, 12)}
+    lo, hi = ranges.get(difficulty, (3, len(full_pool)))
+    count = rng.randint(lo, min(hi, len(full_pool)))
+    return rng.sample(full_pool, count)
+
+
 def scan_mock(
     image_tag: str,
     difficulty: int = 1,
     current_dockerfile: str | None = None,
+    vuln_pool: list | None = None,
 ) -> VulnReport:
-    """Return a deterministic mock vulnerability report.
+    """Return a mock vulnerability report.
+
+    *vuln_pool*: if provided, uses this specific set of CVEs instead of the
+    full template (enables per-episode randomization).
 
     When *current_dockerfile* is provided, simulates which CVEs are resolved
     by the Dockerfile changes and detects any regressions introduced.
@@ -639,7 +654,7 @@ def scan_mock(
     import random
     rng = random.Random(hash(image_tag) % 2**32)
 
-    entries = list(_MOCK_TEMPLATES.get(difficulty, _MOCK_TEMPLATES[1]))
+    entries = list(vuln_pool or _MOCK_TEMPLATES.get(difficulty, _MOCK_TEMPLATES[1]))
     if current_dockerfile:
         entries = _simulate_dockerfile_fixes(entries, current_dockerfile)
 

@@ -21,13 +21,8 @@ from models import (
 from tools.scanner import (
     scan_mock, run_scan, check_best_practices, detect_antipatterns,
 )
-from tools.reward_engine import (
-    compute_step_reward, compute_terminal_reward, build_severity_delta,
-    compute_normalized_reward,
-)
 from tools.docker_manager import DockerBuildManager
 from server.docker_hardening_environment import DockerHardeningEnvironment, TASKS
-from curriculum import get_level, get_sample_dockerfile, CURRICULUM
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -299,87 +294,6 @@ class TestAntipatterns:
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Reward engine
-# ───────────────────────────────────────────────────────────────────────────
-
-class TestRewardEngine:
-    def test_reward_positive_when_vulns_decrease(self):
-        before = make_report(critical=2, high=1)
-        after = make_report(critical=0, high=0)
-        r = compute_step_reward(before, after, None, cycle_number=1)
-        assert r > 0
-
-    def test_reward_negative_when_vulns_increase(self):
-        before = make_report(critical=0, high=1)
-        after = make_report(critical=0, high=2)
-        r = compute_step_reward(before, after, None, cycle_number=1)
-        assert r < 0
-
-    def test_clean_critical_bonus(self):
-        before = make_report(critical=1)
-        after = make_report(critical=0)
-        r = compute_step_reward(before, after, None, cycle_number=1)
-        assert r >= 10.0
-
-    def test_failed_patch_penalty(self):
-        before = make_report(critical=1)
-        after = make_report(critical=1)
-        bad_attempt = PatchAttempt(
-            cycle=1, patch_strategy=PatchStrategy.UPGRADE_PACKAGE,
-            dockerfile_diff="", success=False, error_message="build failed",
-        )
-        r = compute_step_reward(before, after, bad_attempt, cycle_number=1)
-        assert r < 0
-
-    def test_terminal_reward_full_fix(self):
-        initial = make_report(critical=2, high=3)
-        final = make_report(critical=0, high=0)
-        r = compute_terminal_reward(initial, final, total_cycles=2, max_cycles=10)
-        assert r > 40.0
-
-    def test_terminal_reward_failure(self):
-        initial = make_report(critical=2, high=3)
-        final = make_report(critical=2, high=3)
-        r = compute_terminal_reward(initial, final, total_cycles=10, max_cycles=10)
-        assert r < 10.0
-
-    def test_severity_delta(self):
-        before = make_report(critical=2, high=1)
-        after = make_report(critical=1, high=1)
-        delta = build_severity_delta(before, after)
-        assert delta["CRITICAL"] == -1
-        assert delta["HIGH"] == 0
-
-    def test_severity_delta_no_before(self):
-        after = make_report(critical=1)
-        delta = build_severity_delta(None, after)
-        assert delta == {}
-
-    def test_normalized_reward_full_fix(self):
-        initial = make_report(critical=2, high=2, medium=1)
-        final = make_report()
-        r = compute_normalized_reward(initial, final)
-        assert r == 1.0
-
-    def test_normalized_reward_partial(self):
-        initial = make_report(critical=2, high=2)
-        final = make_report(critical=1, high=1)
-        r = compute_normalized_reward(initial, final)
-        assert r == 0.5
-
-    def test_normalized_reward_no_improvement(self):
-        initial = make_report(critical=2)
-        r = compute_normalized_reward(initial, initial)
-        assert r == 0.0
-
-    def test_normalized_reward_empty_initial(self):
-        initial = make_report()
-        final = make_report()
-        r = compute_normalized_reward(initial, final)
-        assert r == 1.0
-
-
-# ───────────────────────────────────────────────────────────────────────────
 # Docker build manager (mock mode)
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -459,14 +373,14 @@ class TestDockerHardeningEnvironment:
         env.reset()
         obs = env.step(DockerHardeningAction(patched_dockerfile=""))
         assert obs.last_action_error is not None
-        assert obs.reward < 0
+        assert obs.reward <= 0.01
 
     def test_step_no_change_penalized(self):
         env = make_env("patch_easy")
         obs_reset = env.reset()
         original = obs_reset.current_dockerfile
         obs = env.step(DockerHardeningAction(patched_dockerfile=original))
-        assert obs.reward < 0
+        assert obs.reward <= 0.01
 
     def test_episode_terminates_within_max_steps(self):
         env = make_env("patch_easy")
@@ -576,131 +490,53 @@ class TestGraderScores:
         assert obs.reward >= 0.0
 
     @pytest.mark.parametrize("task", ["patch_easy", "patch_medium", "patch_hard"])
-    def test_no_change_zero_score(self, task):
+    def test_no_change_low_score(self, task):
         env = make_env(task)
         obs_reset = env.reset()
         original = obs_reset.current_dockerfile
         obs = env.step(DockerHardeningAction(patched_dockerfile=original))
-        assert obs.score == 0.0
-        assert obs.reward < 0
+        assert obs.score <= 0.02
+        assert obs.reward <= 0.02
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # New tasks (difficulty 4-7)
 # ───────────────────────────────────────────────────────────────────────────
 
-class TestNewTasks:
-    @pytest.mark.parametrize("task", [
-        "patch_multistage", "patch_conflict", "patch_subtle", "patch_adversarial",
-    ])
-    def test_reset_new_task(self, task):
-        env = make_env(task)
-        obs = env.reset()
-        assert obs.task_name == task
-        assert obs.initial_vuln_count > 0
-        assert not obs.done
+class TestRandomization:
+    def test_different_resets_produce_different_dockerfiles(self):
+        """Each reset should generate a different Dockerfile."""
+        env = make_env("patch_easy")
+        dockerfiles = set()
+        for _ in range(10):
+            obs = env.reset()
+            dockerfiles.add(obs.current_dockerfile)
+        assert len(dockerfiles) >= 2, \
+            f"Only {len(dockerfiles)} unique Dockerfiles in 10 resets"
 
-    @pytest.mark.parametrize("task", [
-        "patch_multistage", "patch_conflict", "patch_subtle", "patch_adversarial",
-    ])
-    def test_step_new_task(self, task):
-        env = make_env(task)
-        env.reset()
-        patched = (
-            "FROM python:3.12-slim\n"
-            "RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*\n"
-            "WORKDIR /app\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install --no-cache-dir -r requirements.txt\n"
-            "COPY . .\n"
-            "USER 1000\n"
-            "HEALTHCHECK CMD python -c \"import sys\"\n"
-            'CMD ["python", "app.py"]\n'
-        )
-        obs = env.step(DockerHardeningAction(patched_dockerfile=patched))
-        assert obs.reward is not None
-        assert obs.score >= 0.0
-
-    def test_multistage_preserves_structure(self):
-        env = make_env("patch_multistage")
-        env.reset()
-        patched = (
-            "FROM python:3.12-slim AS builder\n"
-            "RUN apt-get update && apt-get install -y --no-install-recommends gcc python3-dev libffi-dev "
-            "&& rm -rf /var/lib/apt/lists/*\n"
-            "WORKDIR /build\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install --no-cache-dir -r requirements.txt\n"
-            "\n"
-            "FROM python:3.12-slim\n"
-            "RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*\n"
-            "WORKDIR /app\n"
-            "COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages\n"
-            "COPY --from=builder /usr/local/bin /usr/local/bin\n"
-            "COPY requirements.txt .\n"
-            "COPY . .\n"
-            "HEALTHCHECK CMD python -c \"import sys\"\n"
-            "USER 1000\n"
-            'CMD ["python", "app.py"]\n'
-        )
-        obs = env.step(DockerHardeningAction(patched_dockerfile=patched))
-        assert obs.reward > 0
-        assert obs.score > 0
-
-    def test_conflict_task_has_no_fix_vulns(self):
-        env = make_env("patch_conflict")
-        obs = env.reset()
-        assert "no fix available" in obs.vulnerability_summary
-
-    def test_subtle_task_has_url_credentials(self):
-        env = make_env("patch_subtle")
-        obs = env.reset()
-        ap = obs.antipattern_warnings
-        assert any("Credentials" in w or "credentials" in w.lower() for w in ap), \
-            f"Expected credential URL warning, got: {ap}"
-
-    def test_adversarial_task_has_decoy(self):
-        env = make_env("patch_adversarial")
-        obs = env.reset()
-        assert "myapp-crypto" in obs.vulnerability_summary
+    def test_all_tasks_produce_valid_dockerfiles(self):
+        for task in TASKS:
+            env = make_env(task)
+            obs = env.reset()
+            assert "FROM " in obs.current_dockerfile
+            assert obs.initial_vuln_count > 0
+            assert not obs.done
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # Mode toggle
 # ───────────────────────────────────────────────────────────────────────────
 
-class TestModeToggle:
-    def test_eval_mode_has_pip_hints(self):
-        os.environ["SCA_GYM_MODE"] = "eval"
+class TestVulnSummary:
+    def test_vulnerability_summary_has_scan_report(self):
         env = make_env("patch_medium")
         obs = env.reset()
-        assert "pip install --upgrade" in obs.vulnerability_summary or \
-               "pip install --no-cache-dir --upgrade" in obs.vulnerability_summary
+        assert "Security Scan Report" in obs.vulnerability_summary
 
-    def test_train_mode_no_pip_hints(self):
-        os.environ["SCA_GYM_MODE"] = "train"
-        try:
-            env = make_env("patch_medium")
-            obs = env.reset()
-            assert "pip install --upgrade" not in obs.vulnerability_summary
-            assert "Python dependency" in obs.vulnerability_summary
-        finally:
-            os.environ["SCA_GYM_MODE"] = "eval"
-
-    def test_eval_mode_has_ready_to_copy_cmd(self):
-        os.environ["SCA_GYM_MODE"] = "eval"
+    def test_vulnerability_summary_has_best_practices(self):
         env = make_env("patch_medium")
         obs = env.reset()
-        assert "RUN pip install --no-cache-dir --upgrade" in obs.vulnerability_summary
-
-    def test_train_mode_no_ready_to_copy_cmd(self):
-        os.environ["SCA_GYM_MODE"] = "train"
-        try:
-            env = make_env("patch_medium")
-            obs = env.reset()
-            assert "RUN pip install --no-cache-dir --upgrade" not in obs.vulnerability_summary
-        finally:
-            os.environ["SCA_GYM_MODE"] = "eval"
+        assert "Best Practices Checklist" in obs.vulnerability_summary
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -711,65 +547,9 @@ class TestRegressionPenalty:
     def test_latest_tag_causes_regression(self):
         env = make_env("patch_easy")
         env.reset()
-        patched = "FROM python:latest\nCOPY . .\n"
+        patched = "FROM python:latest\nCOPY . .\n" 'CMD ["python", "app.py"]\n'
         obs = env.step(DockerHardeningAction(patched_dockerfile=patched))
         assert "REGRESSION" in obs.vulnerability_summary
-
-    def test_alpine_c_extension_regression(self):
-        env = make_env("patch_conflict")
-        env.reset()
-        patched = (
-            "FROM python:3.12-alpine\n"
-            "RUN pip install --no-cache-dir --upgrade numpy>=1.26.4\n"
-            "COPY . .\n"
-        )
-        obs = env.step(DockerHardeningAction(patched_dockerfile=patched))
-        assert "REGRESSION" in obs.vulnerability_summary
-
-    def test_regression_penalty_in_step_summary(self):
-        env = make_env("patch_conflict")
-        env.reset()
-        patched = (
-            "FROM python:3.9-slim\n"
-            "RUN apt-get update && apt-get install -y libssl1.1\n"
-            "RUN pip install --no-cache-dir --upgrade cryptography>=42.0.0\n"
-            "COPY . .\n"
-        )
-        obs = env.step(DockerHardeningAction(patched_dockerfile=patched))
-        assert "REGRESSION" in obs.step_summary or "CONFLICT" in obs.step_summary
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Curriculum
-# ───────────────────────────────────────────────────────────────────────────
-
-class TestCurriculum:
-    def test_all_levels_defined(self):
-        for level in range(1, 8):
-            lvl = get_level(level)
-            assert lvl.level == level
-            assert lvl.max_cycles > 0
-
-    def test_sample_dockerfiles(self):
-        for level in range(1, 8):
-            df = get_sample_dockerfile(level)
-            assert "FROM" in df
-
-    def test_invalid_level(self):
-        with pytest.raises(ValueError):
-            get_level(99)
-
-    def test_difficulty_increases(self):
-        lvl1 = get_level(1)
-        lvl3 = get_level(3)
-        assert lvl3.max_cycles >= lvl1.max_cycles
-        assert lvl3.expected_severity_mix.get("CRITICAL", 0) > lvl1.expected_severity_mix.get("CRITICAL", 0)
-
-    def test_levels_4_through_7_exist(self):
-        for level in [4, 5, 6, 7]:
-            lvl = get_level(level)
-            assert lvl.name != ""
-            assert len(lvl.sample_dockerfiles) > 0
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -780,8 +560,6 @@ class TestAllTasksAccessible:
     @pytest.mark.parametrize("task", list(TASKS.keys()))
     def test_task_defined(self, task):
         assert "difficulty" in TASKS[task]
-        assert "image_tag" in TASKS[task]
-        assert "dockerfile" in TASKS[task]
         assert "max_steps" in TASKS[task]
 
     @pytest.mark.parametrize("task", list(TASKS.keys()))

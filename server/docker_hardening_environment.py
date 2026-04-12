@@ -1,15 +1,18 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+"""
+Core environment logic — 2-step episodes with randomized Dockerfiles.
 
-"""Core environment logic — task definitions, scoring, and the step/reset loop."""
+Step 1 (Analyze): Agent identifies security issues → receives actionable feedback.
+Step 2 (Patch):   Agent submits a patched Dockerfile → graded on actual improvement.
+
+Each reset() generates a DIFFERENT broken Dockerfile from a randomized pool,
+preventing memorization and forcing genuine security reasoning.
+"""
 
 import os
+import random
 import re
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
@@ -22,9 +25,14 @@ try:
     )
     from ..tools.scanner import (
         scan_mock, check_best_practices, detect_antipatterns,
-        validate_base_image_tag,
+        validate_base_image_tag, select_vuln_subset,
     )
     from ..tools.docker_manager import DockerBuildManager, DockerBuildError
+    from ..tasks.generators import (
+        select_issues, generate_dockerfile, ISSUE_CATEGORY_MAP,
+    )
+    from ..graders import GRADER_MAP
+    from ..graders.analysis_grader import AnalysisGrader
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from models import (
@@ -34,217 +42,40 @@ except ImportError:
     )
     from tools.scanner import (
         scan_mock, check_best_practices, detect_antipatterns,
-        validate_base_image_tag,
+        validate_base_image_tag, select_vuln_subset,
     )
     from tools.docker_manager import DockerBuildManager, DockerBuildError
-
-
-def _get_mode() -> str:
-    mode = os.environ.get("SCA_GYM_MODE", "eval").strip().lower()
-    return mode if mode in ("eval", "train") else "eval"
+    from tasks.generators import (
+        select_issues, generate_dockerfile, ISSUE_CATEGORY_MAP,
+    )
+    from graders import GRADER_MAP
+    from graders.analysis_grader import AnalysisGrader
 
 
 TASKS = {
-    # ── Hackathon tasks (difficulty 1-3) ──────────────────────────────────
-    "patch_easy": {
-        "difficulty": 1,
-        "image_tag": "python:3.11-slim",
-        "max_steps": 4,
-        "dockerfile": (
-            "FROM python:3.11-slim\n"
-            "RUN apt-get update && apt-get install -y curl wget\n"
-            "RUN curl -sSL https://install.example.com/setup.sh | bash\n"
-            "WORKDIR /app\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install -r requirements.txt\n"
-            "COPY . .\n"
-            "EXPOSE 8080\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
-    "patch_medium": {
-        "difficulty": 2,
-        "image_tag": "python:3.9-slim",
-        "max_steps": 4,
-        "dockerfile": (
-            "FROM python:3.9-slim\n"
-            "ARG DB_PASSWORD=admin123\n"
-            "ENV APP_SECRET_KEY=my-secret-key-do-not-share\n"
-            "RUN apt-get update && apt-get install -y curl wget git\n"
-            "RUN curl -sSL https://raw.githubusercontent.com/example/setup/main/init.sh | sh\n"
-            "WORKDIR /app\n"
-            "ADD requirements.txt /app/requirements.txt\n"
-            "RUN pip install -r requirements.txt\n"
-            "COPY . .\n"
-            "EXPOSE 8080\n"
-            "EXPOSE 6379\n"
-            "HEALTHCHECK CMD true\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
-    "patch_hard": {
-        "difficulty": 3,
-        "image_tag": "python:3.6-slim",
-        "max_steps": 3,
-        "dockerfile": (
-            "FROM python:3.6-slim\n"
-            "ENV DATABASE_PASSWORD=s3cret_passw0rd\n"
-            "ENV API_TOKEN=sk-1234567890abcdef\n"
-            "ENV FLASK_SECRET_KEY=super-secret-key-123\n"
-            "ARG DEPLOY_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
-            "RUN apt-get update && apt-get install -y \\\n"
-            "    libssl1.0 \\\n"
-            "    curl \\\n"
-            "    wget \\\n"
-            "    gcc \\\n"
-            "    python3-dev \\\n"
-            "    && curl -sSL https://get.docker.com | sh\n"
-            "ADD https://example.com/install.sh /tmp/install.sh\n"
-            "RUN chmod +x /tmp/install.sh && sh /tmp/install.sh\n"
-            "WORKDIR /app\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install -r requirements.txt\n"
-            "COPY . .\n"
-            "EXPOSE 5432\n"
-            "EXPOSE 6379\n"
-            "EXPOSE 3306\n"
-            "HEALTHCHECK CMD true\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
-    # ── Training tasks (difficulty 4-7) ───────────────────────────────────
-    "patch_multistage": {
-        "difficulty": 4,
-        "image_tag": "python:3.9-slim",
-        "max_steps": 5,
-        "dockerfile": (
-            "FROM python:3.9-slim AS builder\n"
-            "RUN apt-get update && apt-get install -y gcc python3-dev libffi-dev\n"
-            "WORKDIR /build\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install --no-cache-dir -r requirements.txt\n"
-            "\n"
-            "FROM python:3.9-slim\n"
-            "RUN apt-get update && apt-get install -y curl\n"
-            "WORKDIR /app\n"
-            "COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages\n"
-            "COPY --from=builder /usr/local/bin /usr/local/bin\n"
-            "COPY . .\n"
-            "EXPOSE 8080\n"
-            "HEALTHCHECK CMD true\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
-    "patch_conflict": {
-        "difficulty": 5,
-        "image_tag": "python:3.9-slim",
-        "max_steps": 5,
-        "dockerfile": (
-            "FROM python:3.9-slim\n"
-            "RUN apt-get update && apt-get install -y \\\n"
-            "    libssl1.1 \\\n"
-            "    curl \\\n"
-            "    wget \\\n"
-            "    && rm -rf /var/lib/apt/lists/*\n"
-            "WORKDIR /app\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install -r requirements.txt\n"
-            "COPY . .\n"
-            "EXPOSE 8080\n"
-            "EXPOSE 6379\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
-    "patch_subtle": {
-        "difficulty": 6,
-        "image_tag": "python:3.9-slim",
-        "max_steps": 4,
-        "dockerfile": (
-            "FROM python:3.9-slim\n"
-            "ARG REPO_URL=https://deploy:ghp_s3cretToken123@git.example.com/org/repo.git\n"
-            "ENV AUTH_TOKEN=ZGVwbG95OnMzY3JldFBhc3N3b3JkMTIz\n"
-            "RUN apt-get update && apt-get install -y curl wget git\n"
-            "RUN git clone ${REPO_URL} /src\n"
-            "WORKDIR /app\n"
-            "COPY . .\n"
-            "COPY requirements.txt .\n"
-            "RUN pip install -r requirements.txt\n"
-            "RUN curl -sSL https://install.example.com/agent.sh | bash\n"
-            "EXPOSE 8080\n"
-            "HEALTHCHECK CMD curl -f http://localhost:8080/health || exit 1\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
-    "patch_adversarial": {
-        "difficulty": 7,
-        "image_tag": "python:3.9-slim",
-        "max_steps": 3,
-        "dockerfile": (
-            "FROM python:3.9-slim\n"
-            "ENV APP_NAME=myservice\n"
-            "RUN apt-get update && apt-get install -y \\\n"
-            "    gcc \\\n"
-            "    python3-dev \\\n"
-            "    curl \\\n"
-            "    && rm -rf /var/lib/apt/lists/*\n"
-            "WORKDIR /app\n"
-            "COPY requirements.txt .\n"
-            "USER root\n"
-            "RUN pip install --no-cache-dir -r requirements.txt\n"
-            "COPY . .\n"
-            "RUN chmod 777 /app/tmp\n"
-            "EXPOSE 8080\n"
-            "HEALTHCHECK CMD python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\"\n"
-            'CMD ["python", "app.py"]\n'
-        ),
-    },
+    "patch_easy":   {"difficulty": 1, "max_steps": 2},
+    "patch_medium": {"difficulty": 2, "max_steps": 2},
+    "patch_hard":   {"difficulty": 3, "max_steps": 2},
 }
 
 DEFAULT_TASK = "patch_easy"
 
-_W_VULN = 0.50
-_W_BP   = 0.30
-_W_AP   = 0.20
-
-_W_VULN_HARD = 0.40
-_W_BP_HARD   = 0.30
-_W_AP_HARD   = 0.30
-
 _SEVERITY_WEIGHT = {
-    Severity.CRITICAL:   4.0,
-    Severity.HIGH:       3.0,
-    Severity.MEDIUM:     2.0,
-    Severity.LOW:        1.0,
-    Severity.NEGLIGIBLE: 0.5,
-    Severity.UNKNOWN:    1.0,
+    Severity.CRITICAL: 4.0, Severity.HIGH: 3.0, Severity.MEDIUM: 2.0,
+    Severity.LOW: 1.0, Severity.NEGLIGIBLE: 0.5, Severity.UNKNOWN: 1.0,
 }
-
-_STEP_COST        = 0.02
-_NOOP_PENALTY     = 0.05
-_BUILD_FAIL_COST  = 0.03
-_REGRESSION_COST  = 0.10
-_EFFICIENCY_BONUS = {1: 0.10, 2: 0.05}
 
 _BP_LABELS = {
-    "non_root_user":    "Non-root USER instruction",
-    "healthcheck":      "HEALTHCHECK instruction defined",
+    "non_root_user":     "Non-root USER instruction",
+    "healthcheck":       "HEALTHCHECK instruction defined",
     "no_secrets_in_env": "No secrets in ENV/ARG instructions",
     "apt_cache_cleanup": "APT cache cleaned (rm -rf /var/lib/apt/lists/*)",
-    "pip_no_cache":     "pip --no-cache-dir flag used",
-    "copy_over_add":    "COPY used instead of ADD",
+    "pip_no_cache":      "pip --no-cache-dir flag used",
+    "copy_over_add":     "COPY used instead of ADD",
     "modern_base_image": "Modern base image (Python >= 3.12)",
-    "layer_efficiency": "Consecutive RUN commands merged (max 2)",
-    "copy_order":       "COPY requirements.txt before COPY . . (cache efficiency)",
-    "minimal_packages": "apt-get install uses --no-install-recommends",
-}
-
-_REGRESSION_PREFIXES = ("REGRESSION-", "CONFLICT-", "BUILD-FAIL-")
-
-
-_PIP_PACKAGES = {
-    "setuptools", "requests", "pyyaml", "urllib3", "certifi",
-    "pillow", "cryptography", "flask", "jinja2", "werkzeug",
-    "numpy", "scipy", "pandas",
+    "layer_efficiency":  "Consecutive RUN commands merged (max 2)",
+    "copy_order":        "COPY requirements.txt before COPY . . (cache efficiency)",
+    "minimal_packages":  "apt-get install uses --no-install-recommends",
 }
 
 
@@ -252,7 +83,6 @@ def _format_vuln_summary(
     report: VulnReport, bp_results: dict,
     ap_warnings: List[str], difficulty: int,
 ) -> str:
-    mode = _get_mode()
     lines = [
         "=== Security Scan Report ===",
         f"Vulnerabilities found: {report.total_count}",
@@ -261,49 +91,51 @@ def _format_vuln_summary(
     ]
 
     severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE"]
-    pip_vulns = []
+    pip_pkgs = {
+        "setuptools", "requests", "pyyaml", "urllib3", "certifi",
+        "pillow", "cryptography", "flask", "jinja2", "werkzeug",
+        "numpy", "scipy", "pandas",
+    }
 
+    pip_vulns = []
     for v in sorted(
         report.vulnerabilities,
         key=lambda x: severity_order.index(x.severity.value)
         if x.severity.value in severity_order else 99,
     ):
-        is_pip = v.package_name.lower() in _PIP_PACKAGES
-        is_regression = any(v.cve_id.startswith(p) for p in _REGRESSION_PREFIXES)
+        is_pip = v.package_name.lower() in pip_pkgs
+        is_regression = any(
+            v.cve_id.startswith(p) for p in ("REGRESSION-", "CONFLICT-", "BUILD-FAIL-")
+        )
 
         if is_regression:
             lines.append(f"  [REGRESSION] {v.cve_id} | {v.package_name}")
             lines.append(f"    {v.description}")
             continue
 
-        if mode == "eval":
-            if is_pip and difficulty >= 2:
-                fix = f" -> fix: pip install --upgrade {v.package_name}>={v.fixed_version}"
-                pip_vulns.append(v)
-            elif v.fixed_version:
-                fix = f" -> fix: {v.fixed_version}"
-            else:
-                fix = " (no fix available)"
+        if is_pip and difficulty >= 2:
+            fix = f" -> fix: pip install --upgrade {v.package_name}>={v.fixed_version}"
+            pip_vulns.append(v)
+        elif v.fixed_version:
+            fix = f" -> fix: {v.fixed_version}"
         else:
-            if is_pip:
-                pip_vulns.append(v)
-                fix = " (Python dependency — requires explicit pip upgrade)"
-            elif v.fixed_version is None:
-                fix = " (no fix available)"
-            elif difficulty >= 4:
-                fix = " (system package — upgrade base or apt-get upgrade)"
-            else:
-                fix = f" -> fix: {v.fixed_version}"
+            fix = " (no fix available)"
 
-        lines.append(f"  [{v.severity.value}] {v.cve_id} | {v.package_name} {v.installed_version}{fix}")
+        lines.append(
+            f"  [{v.severity.value}] {v.cve_id} | "
+            f"{v.package_name} {v.installed_version}{fix}"
+        )
         lines.append(f"    {v.description}")
 
-    if pip_vulns and mode == "eval":
-        pip_cmd_parts = [f"{v.package_name}>={v.fixed_version}" for v in pip_vulns if v.fixed_version]
+    if pip_vulns:
+        pip_cmd_parts = [
+            f"{v.package_name}>={v.fixed_version}"
+            for v in pip_vulns if v.fixed_version
+        ]
         if pip_cmd_parts:
             lines += [
                 "",
-                "=== Python Dependency Fix (add this RUN line to your Dockerfile) ===",
+                "=== Python Dependency Fix ===",
                 f"  RUN pip install --no-cache-dir --upgrade {' '.join(pip_cmd_parts)}",
             ]
 
@@ -330,68 +162,51 @@ def _format_bp_list(bp_results: dict) -> List[str]:
     ]
 
 
-def _diff_summary(old_df: str, new_df: str) -> str:
-    old_lines = old_df.strip().splitlines()
-    new_lines = new_df.strip().splitlines()
-    added = [l for l in new_lines if l not in old_lines]
-    removed = [l for l in old_lines if l not in new_lines]
-    parts = []
-    if removed:
-        parts.append("Removed: " + "; ".join(removed[:5]))
-    if added:
-        parts.append("Added: " + "; ".join(added[:5]))
-    return " | ".join(parts) if parts else "No structural changes detected"
+def _format_analysis_feedback(feedback: dict) -> str:
+    """Format analysis grader feedback into human-readable text for the agent."""
+    lines = ["", "=== Analysis Feedback ==="]
 
+    if feedback.get("issues_confirmed"):
+        lines.append("Issues correctly identified:")
+        for i in feedback["issues_confirmed"]:
+            lines.append(f"  [CONFIRMED] {i}")
 
-def _get_weights(difficulty: int):
-    if difficulty >= 4:
-        return _W_VULN_HARD, _W_BP_HARD, _W_AP_HARD
-    return _W_VULN, _W_BP, _W_AP
+    if feedback.get("issues_missed"):
+        lines.append("Issues you missed:")
+        for i in feedback["issues_missed"]:
+            cat = ISSUE_CATEGORY_MAP.get(i, "other")
+            lines.append(f"  [MISSED] Category: {cat} — look more carefully")
+
+    if feedback.get("false_positives"):
+        lines.append("False positives (not actual issues):")
+        for fp in feedback["false_positives"]:
+            lines.append(f"  [REJECTED] {fp}")
+
+    if feedback.get("categories_confirmed"):
+        lines.append(f"Categories correct: {', '.join(feedback['categories_confirmed'])}")
+    if feedback.get("categories_missed"):
+        lines.append(f"Categories missed: {', '.join(feedback['categories_missed'])}")
+
+    lines.append(
+        f"Detection accuracy: issue={feedback.get('issue_detection_score', 0):.3f}, "
+        f"category={feedback.get('category_detection_score', 0):.3f}"
+    )
+    return "\n".join(lines)
 
 
 def _compute_security_score(vuln_ratio_fixed: float, bp_results: dict, ap_count: int) -> float:
     bp_count = sum(1 for v in bp_results.values() if v)
     bp_total = len(bp_results) or 1
-    return min(100.0,
-               50.0 * vuln_ratio_fixed
-               + 30.0 * (bp_count / bp_total)
-               + 20.0 * max(0.0, 1.0 - ap_count * 0.2))
+    return min(
+        100.0,
+        50.0 * vuln_ratio_fixed
+        + 30.0 * (bp_count / bp_total)
+        + 20.0 * max(0.0, 1.0 - ap_count * 0.2),
+    )
 
 
 def _weighted_vuln_score(vulns: List) -> float:
     return sum(_SEVERITY_WEIGHT.get(v.severity, 1.0) for v in vulns)
-
-
-def _count_regressions(vulns: List) -> int:
-    return sum(1 for v in vulns if any(v.cve_id.startswith(p) for p in _REGRESSION_PREFIXES))
-
-
-def _compute_improvement_score(
-    initial_vulns: List, current_vulns: List,
-    initial_bp: dict, current_bp: dict,
-    initial_ap_count: int, current_ap_count: int,
-    difficulty: int = 1,
-) -> float:
-    w_vuln, w_bp, w_ap = _get_weights(difficulty)
-
-    initial_weight = _weighted_vuln_score(initial_vulns)
-    current_weight = _weighted_vuln_score(current_vulns)
-    vuln_improvement = max(0.0, (initial_weight - current_weight) / max(initial_weight, 1.0))
-
-    init_bp_sat = sum(1 for v in initial_bp.values() if v)
-    curr_bp_sat = sum(1 for v in current_bp.values() if v)
-    improvable_bp = len(current_bp) - init_bp_sat
-    bp_improvement = (
-        max(0.0, (curr_bp_sat - init_bp_sat) / max(improvable_bp, 1))
-        if improvable_bp > 0 else 0.0
-    )
-
-    ap_improvement = (
-        max(0.0, (initial_ap_count - current_ap_count) / max(initial_ap_count, 1))
-        if initial_ap_count > 0 else 0.0
-    )
-    raw = w_vuln * vuln_improvement + w_bp * bp_improvement + w_ap * ap_improvement
-    return max(0.01, min(0.99, raw))
 
 
 def _validate_dockerfile(content: str) -> Optional[str]:
@@ -409,7 +224,6 @@ def _validate_dockerfile(content: str) -> Optional[str]:
         tag_error = validate_base_image_tag(image_ref)
         if tag_error:
             return f"Invalid base image: {tag_error}"
-
     return None
 
 
@@ -426,14 +240,25 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 class DockerHardeningEnvironment(Environment):
-    """OpenEnv environment — agent submits patched Dockerfiles, gets scored."""
+    """
+    OpenEnv environment for Docker security hardening.
+
+    2-step episode design:
+      Step 1 — Analyze: Agent identifies which security issues are present.
+               Returns analysis score + actionable feedback.
+      Step 2 — Patch:   Agent submits a patched Dockerfile.
+               Returns final improvement score.
+
+    Each reset() generates a unique broken Dockerfile from a randomized
+    pool of security issues, preventing memorization.
+    """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self):
         self._task_name: str = ""
         self._difficulty: int = 1
-        self._max_steps: int = 5
+        self._max_steps: int = 2
         self._image_tag: str = ""
         self._original_dockerfile: str = ""
 
@@ -441,14 +266,21 @@ class DockerHardeningEnvironment(Environment):
         self._build_mgr: Optional[DockerBuildManager] = None
         self._initial_report: Optional[VulnReport] = None
         self._last_report: Optional[VulnReport] = None
-        self._cycle_count: int = 0
         self._cumulative_reward: float = 0.0
-        self._consecutive_failures: int = 0
 
         self._prev_bp: dict = {}
         self._prev_ap: List[str] = []
         self._initial_bp: dict = {}
         self._initial_ap: List[str] = []
+
+        self._episode_seed: int = 0
+        self._active_issues: Set[str] = set()
+        self._active_vuln_pool: list = []
+        self._analysis_completed: bool = False
+        self._analysis_feedback: str = ""
+        self._analysis_reward: float = 0.0
+
+        self._analysis_grader = AnalysisGrader()
 
     def reset(self) -> DockerHardeningObservation:
         if self._build_mgr:
@@ -462,28 +294,43 @@ class DockerHardeningEnvironment(Environment):
         self._task_name = task_name
         self._difficulty = task["difficulty"]
         self._max_steps = task["max_steps"]
-        self._image_tag = task["image_tag"]
-        self._original_dockerfile = task["dockerfile"]
 
         episode_id = str(uuid4())
+        self._episode_seed = random.randint(0, 2**31)
+        rng = random.Random(self._episode_seed)
+
+        self._active_issues = select_issues(task_name, rng)
+        dockerfile, image_tag, metadata = generate_dockerfile(
+            task_name, self._active_issues, rng,
+        )
+
+        self._image_tag = image_tag
+        self._original_dockerfile = dockerfile
+
         self._state = DockerHardeningState(
             episode_id=episode_id, step_count=0, task_name=task_name,
         )
-        self._cycle_count = 0
         self._cumulative_reward = 0.0
-        self._consecutive_failures = 0
+        self._analysis_completed = False
+        self._analysis_feedback = ""
+        self._analysis_reward = 0.0
 
         self._build_mgr = DockerBuildManager(
-            base_image_tag=self._image_tag, episode_id=episode_id, use_mock=True,
+            base_image_tag=image_tag, episode_id=episode_id, use_mock=True,
         )
-        self._build_mgr.initialise(self._original_dockerfile)
+        self._build_mgr.initialise(dockerfile)
 
-        initial_report = scan_mock(self._image_tag, difficulty=self._difficulty)
+        self._active_vuln_pool = select_vuln_subset(self._difficulty, rng)
+
+        initial_report = scan_mock(
+            image_tag, difficulty=self._difficulty,
+            vuln_pool=self._active_vuln_pool,
+        )
         self._initial_report = initial_report
         self._last_report = initial_report
 
-        bp = check_best_practices(self._original_dockerfile)
-        ap = detect_antipatterns(self._original_dockerfile)
+        bp = check_best_practices(dockerfile)
+        ap = detect_antipatterns(dockerfile)
         self._initial_bp = bp
         self._initial_ap = ap
         self._prev_bp = bp
@@ -493,16 +340,21 @@ class DockerHardeningEnvironment(Environment):
         sec_score = _compute_security_score(0.0, bp, len(ap))
 
         return DockerHardeningObservation(
-            current_dockerfile=self._original_dockerfile,
+            current_dockerfile=dockerfile,
             vulnerability_summary=vuln_summary,
             task_name=task_name,
             initial_vuln_count=initial_report.total_count,
             current_vuln_count=initial_report.total_count,
-            step_number=0, max_steps=self._max_steps,
-            score=0.01, done=False, reward=0.0,
+            step_number=0,
+            max_steps=self._max_steps,
+            score=0.01,
+            done=False,
+            reward=0.0,
             step_summary=(
-                f"Task '{task_name}' started. "
-                f"Fix {initial_report.total_count} vulnerabilities in {self._image_tag}."
+                f"Task '{task_name}' started (seed={self._episode_seed}). "
+                f"Step 1: Identify security issues. "
+                f"Step 2: Submit patched Dockerfile. "
+                f"Found {initial_report.total_count} vulnerabilities in {image_tag}."
             ),
             security_score=round(sec_score, 1),
             best_practices=_format_bp_list(bp),
@@ -511,108 +363,184 @@ class DockerHardeningEnvironment(Environment):
 
     def step(self, action: DockerHardeningAction) -> DockerHardeningObservation:
         self._state.step_count += 1
-        self._cycle_count += 1
         step_num = self._state.step_count
+
+        is_analysis = self._detect_analysis(action)
+
+        if is_analysis and not self._analysis_completed:
+            return self._handle_analysis(action, step_num)
+        else:
+            return self._handle_patch(action, step_num)
+
+    def _detect_analysis(self, action: DockerHardeningAction) -> bool:
+        """Auto-detect whether the action is an analysis or a patch."""
+        content = action.patched_dockerfile.strip()
+
+        if content.startswith("{") or content.startswith("["):
+            return True
+
+        analysis_keywords = [
+            "identified_issues", "identified_categories",
+            "suspicious", "analysis", "findings",
+        ]
+        content_lower = content.lower()
+        if any(kw in content_lower for kw in analysis_keywords):
+            if "FROM " not in content.upper():
+                return True
+
+        return False
+
+    def _handle_analysis(
+        self, action: DockerHardeningAction, step_num: int,
+    ) -> DockerHardeningObservation:
+        """Step 1: Score the agent's issue identification, return feedback."""
+        import json
+
+        raw = action.patched_dockerfile.strip()
+        try:
+            agent_claims = json.loads(raw)
+        except json.JSONDecodeError:
+            agent_claims = {
+                "identified_issues": [raw],
+                "identified_categories": [],
+            }
+
+        if isinstance(agent_claims, list):
+            agent_claims = {
+                "identified_issues": agent_claims,
+                "identified_categories": [],
+            }
+
+        analysis_reward, feedback = self._analysis_grader.score(
+            agent_claims, self._active_issues,
+        )
+
+        self._analysis_completed = True
+        self._analysis_reward = analysis_reward
+        feedback_text = _format_analysis_feedback(feedback)
+        self._analysis_feedback = feedback_text
+        self._cumulative_reward += analysis_reward
+
+        vuln_summary = _format_vuln_summary(
+            self._last_report, self._prev_bp, self._prev_ap, self._difficulty,
+        )
+        vuln_summary += feedback_text
+
+        return DockerHardeningObservation(
+            current_dockerfile=self._original_dockerfile,
+            vulnerability_summary=vuln_summary,
+            task_name=self._task_name,
+            initial_vuln_count=self._initial_report.total_count if self._initial_report else 0,
+            current_vuln_count=self._last_report.total_count if self._last_report else 0,
+            step_number=step_num,
+            max_steps=self._max_steps,
+            score=max(0.01, min(0.99, analysis_reward)),
+            done=False,
+            reward=round(analysis_reward, 4),
+            step_summary=(
+                f"Analysis step: identified {len(feedback.get('issues_confirmed', []))} "
+                f"of {len(self._active_issues)} issues correctly. "
+                f"Analysis score: {analysis_reward:.3f}. "
+                f"Now submit your patched Dockerfile."
+            ),
+            security_score=round(
+                _compute_security_score(0.0, self._prev_bp, len(self._prev_ap)), 1,
+            ),
+            best_practices=_format_bp_list(self._prev_bp),
+            antipattern_warnings=self._prev_ap,
+        )
+
+    def _handle_patch(
+        self, action: DockerHardeningAction, step_num: int,
+    ) -> DockerHardeningObservation:
+        """Step 2: Score the patched Dockerfile."""
         patched_df = action.patched_dockerfile
 
         error = _validate_dockerfile(patched_df)
         if error:
-            self._consecutive_failures += 1
-            done, reason = self._check_termination()
             return self._make_obs(
-                reward=-_BUILD_FAIL_COST, done=done, reason=reason,
+                reward=0.01, done=True,
+                reason=TerminationReason.PATCH_FAILED_TOO_MANY_TIMES,
                 step_summary=f"Invalid Dockerfile: {error}", error=error,
             )
 
         patched_df = _strip_markdown_fences(patched_df)
 
         if patched_df.strip() == self._build_mgr.current_dockerfile.strip():
-            self._consecutive_failures += 1
-            done, reason = self._check_termination()
             return self._make_obs(
-                reward=-_NOOP_PENALTY, done=done, reason=reason,
-                step_summary="Dockerfile unchanged — no improvement (repeat penalty applied).",
+                reward=0.01, done=True,
+                reason=TerminationReason.MAX_CYCLES_REACHED,
+                step_summary="Dockerfile unchanged — no improvement.",
             )
 
         try:
             new_tag, _ = self._build_mgr.apply_patch(patched_df)
         except DockerBuildError as e:
-            self._consecutive_failures += 1
-            done, reason = self._check_termination()
             return self._make_obs(
-                reward=-_BUILD_FAIL_COST, done=done, reason=reason,
+                reward=0.01, done=True,
+                reason=TerminationReason.PATCH_FAILED_TOO_MANY_TIMES,
                 step_summary=f"Build failed: {str(e)[:200]}",
                 error=str(e)[:200],
             )
 
-        new_report = scan_mock(new_tag, difficulty=self._difficulty, current_dockerfile=patched_df)
-        report_before = self._last_report
+        grader_cls = GRADER_MAP.get(self._task_name)
+        if grader_cls:
+            grader = grader_cls()
+            patch_score, breakdown = grader.score(
+                initial_dockerfile=self._original_dockerfile,
+                patched_dockerfile=patched_df,
+                image_tag=self._image_tag,
+                active_issues=self._active_issues,
+                vuln_pool=self._active_vuln_pool,
+            )
+        else:
+            patch_score = 0.01
+            breakdown = {}
+
+        new_report = scan_mock(
+            new_tag, difficulty=self._difficulty,
+            current_dockerfile=patched_df,
+            vuln_pool=self._active_vuln_pool,
+        )
         self._last_report = new_report
-        self._consecutive_failures = 0
 
         new_bp = check_best_practices(patched_df)
         new_ap = detect_antipatterns(patched_df)
-
-        initial_vulns = self._initial_report.vulnerabilities if self._initial_report else []
-        prev_vulns = report_before.vulnerabilities if report_before else initial_vulns
-        initial_count = len(initial_vulns)
-
-        prev_score = _compute_improvement_score(
-            initial_vulns, prev_vulns,
-            self._initial_bp, self._prev_bp,
-            len(self._initial_ap), len(self._prev_ap),
-            self._difficulty,
-        )
-        curr_score = _compute_improvement_score(
-            initial_vulns, new_report.vulnerabilities,
-            self._initial_bp, new_bp,
-            len(self._initial_ap), len(new_ap),
-            self._difficulty,
-        )
-        step_reward = (curr_score - prev_score) - _STEP_COST
-
-        regression_count = _count_regressions(new_report.vulnerabilities)
-        if regression_count > 0:
-            step_reward -= _REGRESSION_COST * regression_count
-
-        if self._difficulty < 5 and new_report.total_count == 0 and step_num in _EFFICIENCY_BONUS:
-            step_reward += _EFFICIENCY_BONUS[step_num]
-
-        step_reward = min(step_reward, 1.0)
-        self._cumulative_reward += max(0.0, step_reward)
         self._prev_bp = new_bp
         self._prev_ap = new_ap
 
-        score = curr_score
-        total_fixed = max(0, initial_count - new_report.total_count)
-        vuln_improvement = max(0.0, total_fixed / max(initial_count, 1))
-        sec_score = _compute_security_score(vuln_improvement, new_bp, len(new_ap))
+        if self._analysis_completed:
+            final_score = 0.3 * self._analysis_reward + 0.7 * patch_score
+        else:
+            final_score = patch_score
 
-        done, reason = self._check_termination()
+        final_score = max(0.01, min(0.99, final_score))
+        self._cumulative_reward += patch_score
 
-        vulns_before = report_before.total_count if report_before else initial_count
+        initial_count = self._initial_report.total_count if self._initial_report else 0
         curr_bp_sat = sum(1 for v in new_bp.values() if v)
 
-        diff_info = _diff_summary(self._build_mgr.current_dockerfile, patched_df)
-        regression_info = ""
-        if regression_count > 0:
-            reg_names = [v.cve_id for v in new_report.vulnerabilities
-                         if any(v.cve_id.startswith(p) for p in _REGRESSION_PREFIXES)]
-            regression_info = f" REGRESSIONS: {', '.join(reg_names)}."
-
         step_summary = (
-            f"Step {step_num}: {vulns_before} -> {new_report.total_count} vulns. "
+            f"Patch step: {initial_count} -> {new_report.total_count} vulns. "
             f"Best practices: {curr_bp_sat}/{len(new_bp)}. "
             f"Anti-patterns: {len(new_ap)}. "
-            f"Reward: {step_reward:.3f}, Score: {score:.3f}"
-            f"{regression_info}"
+            f"Patch score: {patch_score:.3f}"
         )
+        if self._analysis_completed:
+            step_summary += f", Analysis score: {self._analysis_reward:.3f}"
+        step_summary += f", Final score: {final_score:.3f}"
 
         return self._make_obs(
-            reward=step_reward, done=done, reason=reason,
-            step_summary=step_summary, report=new_report,
-            score=score, bp_results=new_bp, ap_warnings=new_ap,
-            sec_score=sec_score,
+            reward=patch_score,
+            done=True,
+            reason=TerminationReason.ALL_VULNS_FIXED
+            if new_report.total_count == 0
+            else TerminationReason.MAX_CYCLES_REACHED,
+            step_summary=step_summary,
+            report=new_report,
+            score=final_score,
+            bp_results=new_bp,
+            ap_warnings=new_ap,
         )
 
     @property
@@ -622,7 +550,7 @@ class DockerHardeningEnvironment(Environment):
             step_count=self._state.step_count,
             task_name=self._task_name,
             cumulative_reward=self._cumulative_reward,
-            cycle_count=self._cycle_count,
+            cycle_count=self._state.step_count,
         )
 
     def _make_obs(
@@ -634,7 +562,6 @@ class DockerHardeningEnvironment(Environment):
         error: Optional[str] = None,
         bp_results: Optional[dict] = None,
         ap_warnings: Optional[List[str]] = None,
-        sec_score: Optional[float] = None,
     ) -> DockerHardeningObservation:
         rpt = report or self._last_report
         initial_vulns = self._initial_report.vulnerabilities if self._initial_report else []
@@ -645,19 +572,16 @@ class DockerHardeningEnvironment(Environment):
         ap = ap_warnings if ap_warnings is not None else self._prev_ap
 
         if score is None:
-            score = _compute_improvement_score(
-                initial_vulns, current_vulns,
-                self._initial_bp, bp,
-                len(self._initial_ap), len(ap),
-                self._difficulty,
-            )
+            score = 0.01
 
         initial_count = len(initial_vulns)
-        if sec_score is None:
-            vuln_ratio = max(0.0, (initial_count - current_count) / max(initial_count, 1))
-            sec_score = _compute_security_score(vuln_ratio, bp, len(ap))
+        vuln_ratio = max(0.0, (initial_count - current_count) / max(initial_count, 1))
+        sec_score = _compute_security_score(vuln_ratio, bp, len(ap))
 
         vuln_summary = _format_vuln_summary(rpt, bp, ap, self._difficulty) if rpt else ""
+
+        if self._analysis_feedback and not done:
+            vuln_summary += self._analysis_feedback
 
         return DockerHardeningObservation(
             current_dockerfile=self._build_mgr.current_dockerfile if self._build_mgr else "",
@@ -672,17 +596,8 @@ class DockerHardeningEnvironment(Environment):
             last_action_error=error,
             termination_reason=reason,
             done=done,
-            reward=round(reward, 4),
+            reward=round(max(0.01, min(0.99, reward)), 4),
             security_score=round(sec_score, 1),
             best_practices=_format_bp_list(bp),
             antipattern_warnings=ap,
         )
-
-    def _check_termination(self):
-        if self._last_report and self._last_report.total_count == 0:
-            return True, TerminationReason.ALL_VULNS_FIXED
-        if self._cycle_count >= self._max_steps:
-            return True, TerminationReason.MAX_CYCLES_REACHED
-        if self._consecutive_failures >= 3:
-            return True, TerminationReason.PATCH_FAILED_TOO_MANY_TIMES
-        return False, None
